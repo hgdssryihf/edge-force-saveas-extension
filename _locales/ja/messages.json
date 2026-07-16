@@ -1,0 +1,22 @@
+{
+  "extName": {
+    "message": "常に名前を付けて保存",
+    "description": "拡張機能の名前"
+  },
+  "extDescription": {
+    "message": "ダウンロードのたびに、OSの「名前を付けて保存」ダイアログを強制的に開きます。",
+    "description": "拡張機能の説明文(edge://extensions での一覧表示等に使用)"
+  },
+  "actionTitle": {
+    "message": "常に名前を付けて保存(クリックでON/OFF切替)",
+    "description": "ツールバーアイコンにマウスを乗せた際に表示されるツールチップ"
+  },
+  "badgeOn": {
+    "message": "ON",
+    "description": "ツールバーアイコンのバッジ(有効時)"
+  },
+  "badgeOff": {
+    "message": "OFF",
+    "description": "ツールバーアイコンのバッジ(無効時)"
+  }
+}
