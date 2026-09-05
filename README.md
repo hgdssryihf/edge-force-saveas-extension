@@ -4,18 +4,7 @@
 
 ## インストール方法(開発者モードで読み込み)
 
-Microsoftストアには公開されていないため、「開発者モード」で手動読み込みします。
-
-1. ダウンロードした `force-saveas-extension-v1.0.1.zip` を**展開(解凍)**する
-   - 展開後、`manifest.json` が入っているフォルダを確認してください
-   - ⚠️ Windowsの「すべて展開」で、zipと同じ名前のフォルダがさらに1つできて
-     `manifest.json` がその中の、さらにもう1つ奥のフォルダに入ってしまう場合が
-     あります。**`manifest.json` が直接見えている階層のフォルダ**を次の手順で選んでください。
-2. Edgeで `edge://extensions` を開く
-3. 左下(または左上)の **「開発者モード」** をオンにする
-4. **「展開して読み込み」** をクリック
-5. 手順1で確認した、`manifest.json` が直接入っているフォルダを選択する
-6. 一覧に「常に名前を付けて保存」が追加されれば完了
+**ストアからインストール**:[Edge版](https://microsoftedge.microsoft.com/addons/detail/%E5%B8%B8%E3%81%AB%E5%90%8D%E5%89%8D%E3%82%92%E4%BB%98%E3%81%91%E3%81%A6%E4%BF%9D%E5%AD%98/gpcbepkjdiomhiblenecabebcefkacnd)
 
 ## 使い方
 
