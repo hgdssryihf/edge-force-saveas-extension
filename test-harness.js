@@ -18,6 +18,7 @@ function makeMockChrome(opts = {}) {
   const listeners = {
     onCreated: [],
     onChanged: [],
+    onDeterminingFilename: [],
     onClicked: [],
     onInstalled: [],
     onStartup: [],
@@ -58,6 +59,13 @@ function makeMockChrome(opts = {}) {
     downloads: {
       onCreated: { addListener: (fn) => listeners.onCreated.push(fn) },
       onChanged: { addListener: (fn) => listeners.onChanged.push(fn) },
+      onDeterminingFilename: {
+        addListener: (fn) => listeners.onDeterminingFilename.push(fn),
+        removeListener: (fn) => {
+          const i = listeners.onDeterminingFilename.indexOf(fn);
+          if (i >= 0) listeners.onDeterminingFilename.splice(i, 1);
+        },
+      },
       cancel: async (id) => {
         calls.cancel.push(id);
         if (opts.cancelShouldFail && opts.cancelShouldFail(id)) {
@@ -97,12 +105,38 @@ function makeMockChrome(opts = {}) {
     }
   }
 
-  return { chrome, calls, listeners, localStore, sessionStore, fireChanged };
+  // 実際のブラウザでは、ダウンロードが作られると(onCreated)、
+  // 少し遅れてファイル名が決定される(onDeterminingFilename)。
+  // この2つをセットで発火させ、その順序を再現するヘルパー。
+  // opts.determinedFilenames = { url: "決定される名前.ext" } で、
+  // URLごとに「Chromeが本来決定するはずだった名前」を指定できる。
+  function triggerOnCreated(item) {
+    for (const fn of listeners.onCreated) {
+      fn(item);
+    }
+    setImmediate(() => {
+      const determined =
+        (opts.determinedFilenames && opts.determinedFilenames[item.url]) || "";
+      for (const fn of listeners.onDeterminingFilename.slice()) {
+        fn({ id: item.id, url: item.url, filename: determined }, () => {});
+      }
+    });
+  }
+
+  return {
+    chrome,
+    calls,
+    listeners,
+    localStore,
+    sessionStore,
+    fireChanged,
+    triggerOnCreated,
+  };
 }
 
 function loadBackgroundScript(chrome) {
   const code = fs.readFileSync("./background.js", "utf8");
-  const sandbox = { chrome, console, setTimeout, setImmediate, Promise };
+  const sandbox = { chrome, console, setTimeout, clearTimeout, setImmediate, Promise };
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox, { filename: "background.js" });
   return sandbox;
@@ -117,10 +151,10 @@ async function wait(ms = 0) {
   // 元のダウンロードが検知されたら、cancel→erase→saveAs付きdownloadが
   // 1回ずつ呼ばれ、再ダウンロードのonCreatedでは二重にcancelされない(無限ループしない)こと。
   {
-    const { chrome, calls, listeners } = makeMockChrome();
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome();
     loadBackgroundScript(chrome);
     const url = "https://example.com/file1.pdf";
-    listeners.onCreated[0]({ id: 1, url, filename: "" });
+    triggerOnCreated({ id: 1, url, filename: "" });
     await wait();
     await wait();
 
@@ -133,12 +167,12 @@ async function wait(ms = 0) {
 
   // --- テスト2: erase失敗時でも再ダウンロードは実行されるべき(修正前のバグ) ---
   {
-    const { chrome, calls, listeners } = makeMockChrome({
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome({
       eraseShouldFail: () => true,
     });
     loadBackgroundScript(chrome);
     const url = "https://example.com/file2.pdf";
-    listeners.onCreated[0]({ id: 2, url, filename: "" });
+    triggerOnCreated({ id: 2, url, filename: "" });
     await wait();
     await wait();
 
@@ -153,12 +187,12 @@ async function wait(ms = 0) {
 
   // --- テスト3: cancel失敗時(既に完了済み)は再ダウンロードしない ---
   {
-    const { chrome, calls, listeners } = makeMockChrome({
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome({
       cancelShouldFail: () => true,
     });
     loadBackgroundScript(chrome);
     const url = "https://example.com/file3.pdf";
-    listeners.onCreated[0]({ id: 3, url, filename: "" });
+    triggerOnCreated({ id: 3, url, filename: "" });
     await wait();
     await wait();
 
@@ -173,10 +207,10 @@ async function wait(ms = 0) {
 
   // --- テスト4: OFF(無効化)時は何もしない ---
   {
-    const { chrome, calls, listeners } = makeMockChrome({ enabled: false });
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome({ enabled: false });
     loadBackgroundScript(chrome);
     const url = "https://example.com/file4.pdf";
-    listeners.onCreated[0]({ id: 4, url, filename: "" });
+    triggerOnCreated({ id: 4, url, filename: "" });
     await wait();
     await wait();
 
@@ -186,11 +220,11 @@ async function wait(ms = 0) {
 
   // --- テスト5: 同じURLへの同時ダウンロード(件数管理)が破綻しないこと ---
   {
-    const { chrome, calls, listeners } = makeMockChrome();
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome();
     loadBackgroundScript(chrome);
     const url = "https://example.com/same.pdf";
-    listeners.onCreated[0]({ id: 5, url, filename: "" });
-    listeners.onCreated[0]({ id: 6, url, filename: "" });
+    triggerOnCreated({ id: 5, url, filename: "" });
+    triggerOnCreated({ id: 6, url, filename: "" });
     await wait();
     await wait();
     await wait();
@@ -205,10 +239,10 @@ async function wait(ms = 0) {
   // これが今回報告された「ブラウザを閉じると大量の.tempファイルが延々と
   // 作られる」バグの直接の再現・修正確認テスト。
   {
-    const { chrome, calls, listeners } = makeMockChrome({ windowCount: 0 });
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome({ windowCount: 0 });
     loadBackgroundScript(chrome);
     const url = "https://example.com/file6.pdf";
-    listeners.onCreated[0]({ id: 6, url, filename: "" });
+    triggerOnCreated({ id: 6, url, filename: "" });
     await wait();
     await wait();
 
@@ -227,13 +261,13 @@ async function wait(ms = 0) {
 
   // --- テスト7: 同じURLへの横取りが繰り返されすぎたら自動的にあきらめる(安全装置) ---
   {
-    const { chrome, calls, listeners } = makeMockChrome();
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome();
     loadBackgroundScript(chrome);
     const url = "https://example.com/repeated.pdf";
     // 同じURLへの「新規の」ダウンロードが短時間に5回発生したと仮定
     // (原因を問わず、無限/過剰な横取りが起きないことを保証するテスト)
     for (let i = 0; i < 5; i++) {
-      listeners.onCreated[0]({ id: 100 + i, url, filename: "" });
+      triggerOnCreated({ id: 100 + i, url, filename: "" });
       await wait();
       await wait();
     }
@@ -249,10 +283,10 @@ async function wait(ms = 0) {
   // --- テスト8: 保存ダイアログでキャンセルされたら、履歴からも消去する ---
   // (「.tempファイルが残って再ダウンロードが始まる」バグへの対策の検証)
   {
-    const { chrome, calls, listeners, fireChanged } = makeMockChrome();
+    const { chrome, calls, listeners, fireChanged, triggerOnCreated } = makeMockChrome();
     loadBackgroundScript(chrome);
     const url = "https://example.com/canceled-by-user.pdf";
-    listeners.onCreated[0]({ id: 8, url, filename: "" });
+    triggerOnCreated({ id: 8, url, filename: "" });
     await wait();
     await wait();
 
@@ -277,11 +311,11 @@ async function wait(ms = 0) {
   // --- テスト9: 開始時刻が古いダウンロードは横取りしない ---
   // (「再起動すると過去のファイルが再ダウンロードされる」バグへの対策A)
   {
-    const { chrome, calls, listeners } = makeMockChrome();
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome();
     loadBackgroundScript(chrome);
     const url = "https://example.com/old-download.pdf";
     const oldStartTime = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1時間前
-    listeners.onCreated[0]({ id: 9, url, filename: "", startTime: oldStartTime });
+    triggerOnCreated({ id: 9, url, filename: "", startTime: oldStartTime });
     await wait();
     await wait();
 
@@ -296,7 +330,7 @@ async function wait(ms = 0) {
   // --- テスト10: ブラウザ起動直後の猶予期間中は横取りしない ---
   // (「再起動すると過去のファイルが再ダウンロードされる」バグへの対策B)
   {
-    const { chrome, calls, listeners } = makeMockChrome();
+    const { chrome, calls, listeners, triggerOnCreated } = makeMockChrome();
     loadBackgroundScript(chrome);
     // chrome.runtime.onStartup が発火した直後の状況を再現
     for (const fn of listeners.onStartup) await fn();
@@ -304,7 +338,7 @@ async function wait(ms = 0) {
 
     const url = "https://example.com/right-after-startup.pdf";
     const freshStartTime = new Date().toISOString();
-    listeners.onCreated[0]({ id: 10, url, filename: "", startTime: freshStartTime });
+    triggerOnCreated({ id: 10, url, filename: "", startTime: freshStartTime });
     await wait();
     await wait();
 
@@ -314,6 +348,30 @@ async function wait(ms = 0) {
       "起動直後の猶予期間中はcancelされるべきではない(横取りしない)"
     );
     console.log("テスト10 (起動直後の猶予期間中は横取りしない): PASS");
+  }
+
+  // --- テスト11: サイトが意図したファイル名(download属性等)が
+  //     再ダウンロード時にも引き継がれること ---
+  // (「保存するときに名前が変わってしまう」バグへの対策の検証)
+  {
+    const url = "https://example.com/api/download?id=12345";
+    const intendedFilename = "請求書_2026年7月.pdf";
+    const { chrome, calls, triggerOnCreated } = makeMockChrome({
+      determinedFilenames: { [url]: intendedFilename },
+    });
+    loadBackgroundScript(chrome);
+    triggerOnCreated({ id: 11, url, filename: "" });
+    await wait();
+    await wait();
+    await wait();
+
+    assert.strictEqual(calls.download.length, 1, "再ダウンロードが1回発行されているべき");
+    assert.strictEqual(
+      calls.download[0].filename,
+      intendedFilename,
+      "再ダウンロード時に、サイトが意図した本来のファイル名が引き継がれるべき"
+    );
+    console.log("テスト11 (意図したファイル名が引き継がれる): PASS");
   }
 
   console.log("\n全テスト成功");

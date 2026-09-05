@@ -6,27 +6,89 @@
 // 3. 同じURLに対して chrome.downloads.download({ saveAs: true }) を
 //    呼び出し、OSの「名前を付けて保存」ダイアログを強制的に開かせる
 //
-// PENDING は「自分自身が再ダウンロードを仕掛けたURL」を記録しておき、
+// EXPECTED は「自分自身が再発行したダウンロードのID」を記録しておき、
 // そのダウンロードが onCreated で再度検知された際に
 // 無限ループ(キャンセル→再ダウンロード→キャンセル…)にならないようにするためのもの。
 
-// 【バグ修正】以前は PENDING をただの in-memory Map で持っていたが、
-// Manifest V3 の service worker はアイドル状態になると破棄され、
-// 次のイベントで再起動されるとメモリ上の変数は消えてしまう。
-// (今回のキャンセル→再ダウンロードの一連の処理は通常ミリ秒単位で完結するため
-//  実際に問題になる頻度は低いが、万一 service worker が再起動を挟むと
-//  再ダウンロード分まで誤ってキャンセルしてしまう可能性があった)
-// chrome.storage.session はブラウザのセッション中は service worker の
-// 再起動をまたいで値が保持されるため、こちらに置き換えて堅牢化する。
-const PENDING_KEY = "pendingUrls";
+// 【重大バグ修正】以前はURLをキーにした「件数カウンタ」で追跡していたが、
+// 同じURLを短時間に2件ダウンロードした場合、片方の再ダウンロードが
+// もう片方の「自分の再ダウンロードだ」という判定を誤って横取りしてしまい、
+// 逆にもう片方が二重に横取りされる、という競合状態がテストで発覚した
+// (ファイル名確定を待つ await を追加した影響で、この競合が起きる隙間が
+//  広がり顕在化した)。
+// ダウンロードIDはブラウザが発行する一意な値なので、URLではなく
+// 「再発行した“その”ダウンロードのID」そのものをキーにすることで、
+// 同じURLの同時ダウンロード同士が互いに干渉しないようにする。
+const EXPECTED_IDS_KEY = "expectedDownloadIds";
 
-async function getPending() {
-  const { [PENDING_KEY]: pending } = await chrome.storage.session.get(PENDING_KEY);
-  return pending || {};
+async function isExpectedId(id) {
+  const { [EXPECTED_IDS_KEY]: ids } = await chrome.storage.session.get(EXPECTED_IDS_KEY);
+  return !!(ids && ids[id]);
 }
 
-async function setPending(pending) {
-  await chrome.storage.session.set({ [PENDING_KEY]: pending });
+async function markExpectedId(id) {
+  const { [EXPECTED_IDS_KEY]: ids } = await chrome.storage.session.get(EXPECTED_IDS_KEY);
+  const map = ids || {};
+  map[id] = true;
+  await chrome.storage.session.set({ [EXPECTED_IDS_KEY]: map });
+}
+
+async function unmarkExpectedId(id) {
+  const { [EXPECTED_IDS_KEY]: ids } = await chrome.storage.session.get(EXPECTED_IDS_KEY);
+  const map = ids || {};
+  delete map[id];
+  await chrome.storage.session.set({ [EXPECTED_IDS_KEY]: map });
+}
+
+// 【バグ修正】報告されたバグ: 保存ダイアログに表示される名前が、
+// サイトが本来意図していたファイル名と異なってしまう。
+//
+// 原因: サイトによっては <a download="請求書.pdf" href="..."> のように、
+// HTML側の download 属性で保存時のファイル名を指定している。この情報は
+// URLそのものには含まれておらず、ページのDOM/JavaScript側にしかない。
+// 従来はURLだけを使って再ダウンロードを発行していたため、この
+// download属性由来の名前が失われ、Chromeが自動生成した別名
+// (URL末尾等)が保存ダイアログに表示されてしまっていた。
+//
+// 対策: chrome.downloads.onDeterminingFilename は、ブラウザが
+// (download属性やContent-Dispositionヘッダーを考慮したうえで)
+// 本来使うはずだったファイル名を教えてくれるイベント。
+// これを使って正しい名前を先に取得し、再ダウンロード時に明示的に
+// 指定することで、保存ダイアログに正しい名前が表示されるようにする。
+function waitForDeterminedFilename(downloadId, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutId;
+
+    const listener = (item, suggest) => {
+      if (item.id !== downloadId) {
+        // 自分が対象とするダウンロード以外には関与せず、
+        // ブラウザの既定の判断に任せる。
+        suggest();
+        return;
+      }
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutId); // 【バグ修正】早期解決時にタイマーを止め忘れると、
+        // service worker が最大timeoutMs分、無駄に生き続けてしまう。
+        resolve(item.filename || "");
+      }
+      // 元のダウンロード自体の名前は変更しない(このあと即キャンセルするため
+      // 実際に書き込まれることはない)。あくまで名前を「知る」ためだけに使う。
+      suggest();
+      chrome.downloads.onDeterminingFilename.removeListener(listener);
+    };
+
+    chrome.downloads.onDeterminingFilename.addListener(listener);
+
+    timeoutId = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        chrome.downloads.onDeterminingFilename.removeListener(listener);
+        resolve(""); // タイムアウト時は諦め、従来どおりChrome任せにする
+      }
+    }, timeoutMs);
+  });
 }
 
 // 【重大バグ修正】報告されたバグ: ブラウザのウィンドウをすべて閉じても、
@@ -186,12 +248,9 @@ chrome.downloads.onCreated.addListener((item) => withLock(async () => {
 
   // このダウンロードは自分自身が saveAs:true 付きで再発行したものなので、
   // そのまま通過させる(ここでキャンセルすると無限ループになる)。
-  const pending = await getPending();
-  const pendingCount = pending[url] || 0;
-  if (pendingCount > 0) {
-    if (pendingCount - 1 <= 0) delete pending[url];
-    else pending[url] = pendingCount - 1;
-    await setPending(pending);
+  // (IDそのもので判定するため、同じURLの別の同時ダウンロードと混同しない)
+  if (await isExpectedId(item.id)) {
+    await unmarkExpectedId(item.id);
     return;
   }
 
@@ -234,6 +293,13 @@ chrome.downloads.onCreated.addListener((item) => withLock(async () => {
     return;
   }
 
+  // 元のダウンロードをキャンセルする"前"に、Chromeが本来決定するはずだった
+  // ファイル名(download属性やContent-Dispositionヘッダーを反映したもの)を
+  // 取得しておく。ここを飛ばしてキャンセルしてしまうと、再ダウンロード時に
+  // URLだけから名前を推測し直すことになり、サイトが意図した名前と
+  // 異なってしまう(実際に報告された不具合)。
+  const determinedFilename = await waitForDeterminedFilename(item.id);
+
   // 元のダウンロードをキャンセルする
   try {
     await chrome.downloads.cancel(item.id);
@@ -253,44 +319,44 @@ chrome.downloads.onCreated.addListener((item) => withLock(async () => {
     console.warn("ダウンロード履歴の削除に失敗しました(無視して続行します):", e);
   }
 
-  // 同じURLに対して、名前を付けて保存ダイアログ付きで再度ダウンロードを実行
-  const pendingBeforeDownload = await getPending();
-  pendingBeforeDownload[url] = (pendingBeforeDownload[url] || 0) + 1;
-  await setPending(pendingBeforeDownload);
-
-  // 【注】item.filename はこの onCreated の時点ではほぼ確実に空文字列であり
-  // (Chromeがファイル名を確定させるのはもう少し後のタイミングのため)、
-  // 指定してもしなくても実質的にChrome側の自動判定に委ねられる。
-  // ダイアログ上でどのみち編集できるため、あえて明示的には指定していない。
-  chrome.downloads.download(
-    {
-      url: url,
-      saveAs: true,
-    },
-    (newDownloadId) => {
-      if (chrome.runtime.lastError) {
-        const errMsg = chrome.runtime.lastError.message;
-        withLock(async () => {
+  // 【注】ここで determinedFilename (Chromeが本来決定するはずだった名前)を
+  // 明示的に指定することで、保存ダイアログにサイトが意図した名前が表示される。
+  // 取得できなかった場合(タイムアウト等)は、従来どおりChromeの自動判定に任せる。
+  //
+  // 【重大バグ修正】以前はこの download() 呼び出しを待たずに(fire-and-forget)
+  // ハンドラを終えていたため、ロックが早く解放されすぎて、同じURLへの
+  // 別の同時ダウンロードの処理と競合する隙間が生まれていた。
+  // ここで呼び出し結果(新しいダウンロードID)を待ってから記録することで、
+  // ロックが解放される前に「このIDは自分の再発行分だ」という登録を
+  // 確実に完了させる。
+  const newDownloadId = await new Promise((resolve) => {
+    chrome.downloads.download(
+      {
+        url: url,
+        filename: determinedFilename || undefined,
+        saveAs: true,
+      },
+      (id) => {
+        if (chrome.runtime.lastError) {
           console.warn(
             "再ダウンロードに失敗しました(ログイン情報付きURLやblob URL等では起こりえます):",
-            errMsg,
+            chrome.runtime.lastError.message,
             url
           );
-          const p = await getPending();
-          const left = (p[url] || 1) - 1;
-          if (left <= 0) delete p[url];
-          else p[url] = left;
-          await setPending(p);
-        });
-        return;
+          resolve(undefined);
+          return;
+        }
+        resolve(id);
       }
-      // このダウンロードが「保存ダイアログでキャンセルされて中断状態のまま
-      // 履歴に残る」ことのないよう、状態変化を監視できるようIDを記録しておく。
-      if (typeof newDownloadId === "number") {
-        withLock(() => markOwned(newDownloadId));
-      }
-    }
-  );
+    );
+  });
+
+  if (typeof newDownloadId === "number") {
+    await markExpectedId(newDownloadId);
+    // このダウンロードが「保存ダイアログでキャンセルされて中断状態のまま
+    // 履歴に残る」ことのないよう、状態変化を監視できるようIDを記録しておく。
+    await markOwned(newDownloadId);
+  }
 }));
 
 // 【重大バグ修正】自分がsaveAs付きで再発行したダウンロードが、
