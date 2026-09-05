@@ -2,8 +2,6 @@
 
 ダウンロードするたびに、OSの「名前を付けて保存」ダイアログを**強制的に**開かせる拡張機能です。
 
-## インストール方法(開発者モードで読み込み)
-
 **ストアからインストール**:[Edge版](https://microsoftedge.microsoft.com/addons/detail/%E5%B8%B8%E3%81%AB%E5%90%8D%E5%89%8D%E3%82%92%E4%BB%98%E3%81%91%E3%81%A6%E4%BF%9D%E5%AD%98/gpcbepkjdiomhiblenecabebcefkacnd)
 
 ## 使い方
